@@ -78,6 +78,14 @@ export default function FurniturePlanner() {
   const [grid, setGrid] = useState(true);
   const [dragOver, setDragOver] = useState(false);
 
+  // ── measurements ──
+  const [measuring, setMeasuring] = useState(false);
+  const [measurePts, setMeasurePts] = useState([]); // image coords, 0-2 while placing
+  const [hoverPt, setHoverPt] = useState(null); // rubber-band target while placing
+  const [measures, setMeasures] = useState([]); // saved measurement objects
+  const [selMeasure, setSelMeasure] = useState(null);
+  const [measureName, setMeasureName] = useState("");
+
   // persistence
   const [plans, setPlans] = useState([]);
   const [planName, setPlanName] = useState("");
@@ -87,13 +95,19 @@ export default function FurniturePlanner() {
   const vpRef = useRef(null);
   const contentRef = useRef(null);
   const dragRef = useRef(null);
+  const measureDragRef = useRef(null); // { id, end: "a" | "b" }
   const zoomRef = useRef(zoom);
   const idRef = useRef(1);
+  const mIdRef = useRef(1);
   const colorRef = useRef(0);
   const statusTimer = useRef(null);
   useEffect(() => { zoomRef.current = zoom; }, [zoom]);
 
   const selItem = items.find((i) => i.id === sel) || null;
+  const selMeasureObj = measures.find((m) => m.id === selMeasure) || null;
+
+  // distance in feet between two image-coord points, given the current scale
+  const distFt = (a, b) => (scale ? Math.hypot(b.x - a.x, b.y - a.y) / scale : 0);
 
   const flash = (text, kind = "ok") => {
     setStatus({ text, kind });
@@ -128,6 +142,7 @@ export default function FurniturePlanner() {
         }
         setNat({ w: W, h: H });
         setScale(null); setPts([]); setCalib(false); setItems([]); setSel(null);
+        setMeasures([]); setMeasuring(false); setMeasurePts([]); setSelMeasure(null);
         setRestored(false);
         setZoom(fitZoom(W, H));
         setImg(dataURL);
@@ -141,9 +156,13 @@ export default function FurniturePlanner() {
   const applyState = (d) => {
     setImg(d.img); setNat(d.nat); setScale(d.scale ?? null);
     setItems(d.items || []); setGrid(d.grid ?? true);
+    setMeasures(d.measures || []);
     setSel(null); setCalib(false); setPts([]);
+    setMeasuring(false); setMeasurePts([]); setSelMeasure(null);
     const maxId = (d.items || []).reduce((m, i) => Math.max(m, i.id), 0);
     idRef.current = maxId + 1;
+    const maxMId = (d.measures || []).reduce((m, x) => Math.max(m, x.id), 0);
+    mIdRef.current = maxMId + 1;
     colorRef.current = (d.items || []).length;
     if (d.nat) setZoom(fitZoom(d.nat.w, d.nat.h));
   };
@@ -163,7 +182,7 @@ export default function FurniturePlanner() {
   const savePlan = async () => {
     const name = planName.trim();
     if (!name || !img || !HAS_STORE) return;
-    const payload = JSON.stringify({ v: 1, name, img, nat, scale, items, grid, savedAt: Date.now() });
+    const payload = JSON.stringify({ v: 1, name, img, nat, scale, items, measures, grid, savedAt: Date.now() });
     try {
       await window.storage.set(keyFor(name), payload, false);
       setPlanName(""); flash(`Saved "${name}"`); refreshPlans();
@@ -188,6 +207,7 @@ export default function FurniturePlanner() {
   const newPlan = () => {
     setImg(null); setNat(null); setScale(null); setItems([]); setSel(null);
     setCalib(false); setPts([]); setRestored(false);
+    setMeasures([]); setMeasuring(false); setMeasurePts([]); setSelMeasure(null);
     if (HAS_STORE) window.storage.delete(AUTOKEY).catch(() => {});
   };
 
@@ -211,11 +231,11 @@ export default function FurniturePlanner() {
     if (!HAS_STORE || !img || !nat) return;
     const t = setTimeout(() => {
       window.storage
-        .set(AUTOKEY, JSON.stringify({ v: 1, img, nat, scale, items, grid, savedAt: Date.now() }), false)
+        .set(AUTOKEY, JSON.stringify({ v: 1, img, nat, scale, items, measures, grid, savedAt: Date.now() }), false)
         .catch(() => {});
     }, 800);
     return () => clearTimeout(t);
-  }, [img, nat, scale, items, grid]);
+  }, [img, nat, scale, items, measures, grid]);
 
   // ── coordinate helpers ──
   const toImg = useCallback((cx, cy) => {
@@ -226,13 +246,20 @@ export default function FurniturePlanner() {
   // ── drag furniture (window listeners) ──
   useEffect(() => {
     const move = (e) => {
+      const md = measureDragRef.current;
+      if (md) {
+        const c = toImg(e.clientX, e.clientY);
+        setMeasures((prev) => prev.map((m) =>
+          m.id === md.id ? { ...m, [md.end + "x"]: c.x, [md.end + "y"]: c.y } : m));
+        return;
+      }
       const d = dragRef.current;
       if (!d) return;
       const c = toImg(e.clientX, e.clientY);
       setItems((prev) => prev.map((it) =>
         it.id === d.id ? { ...it, x: c.x - d.dx, y: c.y - d.dy } : it));
     };
-    const up = () => { dragRef.current = null; };
+    const up = () => { dragRef.current = null; measureDragRef.current = null; };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
     return () => {
@@ -312,27 +339,38 @@ export default function FurniturePlanner() {
   // ── keyboard ──
   useEffect(() => {
     const onKey = (e) => {
-      if (e.key === "Escape") { setCalib(false); setPts([]); setSel(null); setEditing(null); }
-      if ((e.key === "Delete" || e.key === "Backspace") && sel != null) {
+      if (e.key === "Escape") {
+        setCalib(false); setPts([]); setSel(null); setEditing(null);
+        setMeasuring(false); setMeasurePts([]); setSelMeasure(null);
+      }
+      if (e.key === "Delete" || e.key === "Backspace") {
         const t = e.target.tagName;
-        if (t !== "INPUT" && t !== "TEXTAREA") {
+        if (t === "INPUT" || t === "TEXTAREA") return;
+        if (sel != null) {
           e.preventDefault();
           setItems((p) => p.filter((i) => i.id !== sel));
           setSel(null);
+        } else if (selMeasure != null) {
+          e.preventDefault();
+          setMeasures((p) => p.filter((m) => m.id !== selMeasure));
+          setSelMeasure(null);
         }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [sel]);
+  }, [sel, selMeasure]);
 
   // ── calibration ──
   const onCanvasDown = (e) => {
     if (calib) {
       const c = toImg(e.clientX, e.clientY);
       setPts((p) => (p.length >= 2 ? [c] : [...p, c]));
+    } else if (measuring) {
+      const c = toImg(e.clientX, e.clientY);
+      setMeasurePts((p) => (p.length >= 2 ? [c] : [...p, c]));
     } else if (e.target === contentRef.current || e.target.dataset.bg) {
-      setSel(null); setEditing(null);
+      setSel(null); setEditing(null); setSelMeasure(null);
     }
   };
 
@@ -381,6 +419,41 @@ export default function FurniturePlanner() {
     setSel(id);
   };
 
+  // ── measurements ──
+  const startMeasure = () => {
+    if (!scale) return;
+    setMeasuring(true); setMeasurePts([]); setHoverPt(null);
+    setCalib(false); setPts([]); setSel(null); setEditing(null); setSelMeasure(null);
+  };
+
+  const stopMeasure = () => {
+    setMeasuring(false); setMeasurePts([]); setHoverPt(null); setMeasureName("");
+  };
+
+  const saveMeasure = () => {
+    if (measurePts.length < 2) return;
+    const id = mIdRef.current++;
+    const [a, b] = measurePts;
+    setMeasures((p) => [...p, {
+      id, name: measureName.trim(), ax: a.x, ay: a.y, bx: b.x, by: b.y,
+    }]);
+    setMeasurePts([]); setHoverPt(null); setMeasureName("");
+    setSelMeasure(id);
+  };
+
+  const measureEndDown = (e, m, end) => {
+    if (calib || measuring) return;
+    e.stopPropagation();
+    setSel(null); setSelMeasure(m.id);
+    measureDragRef.current = { id: m.id, end };
+  };
+
+  const selectMeasure = (e, m) => {
+    if (calib || measuring) return;
+    e.stopPropagation();
+    setSel(null); setEditing(null); setSelMeasure(m.id);
+  };
+
   // ── export PNG ──
   const exportPNG = () => {
     if (!img || !nat) return;
@@ -413,6 +486,31 @@ export default function FurniturePlanner() {
         ctx.font = `600 ${fs}px ${SANS}`;
         ctx.textAlign = "center"; ctx.textBaseline = "middle";
         ctx.fillText(it.label, 0, 0);
+        ctx.restore();
+      });
+      // measurements
+      measures.forEach((m) => {
+        const a = { x: m.ax, y: m.ay }, b = { x: m.bx, y: m.by };
+        const label = `${m.name ? m.name + "  " : ""}${ftIn(distFt(a, b) * 12)}`;
+        ctx.save();
+        ctx.strokeStyle = C.green;
+        ctx.fillStyle = C.green;
+        ctx.lineWidth = Math.max(1.5, scale * 0.04);
+        ctx.setLineDash([Math.max(4, scale * 0.14), Math.max(3, scale * 0.1)]);
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        ctx.setLineDash([]);
+        const r = Math.max(2.5, scale * 0.05);
+        [a, b].forEach((p) => { ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill(); });
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        const fs = Math.max(11, Math.min(scale * 0.42, 26));
+        ctx.font = `600 ${fs}px ${MONO}`;
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        const tw = ctx.measureText(label).width;
+        ctx.fillStyle = "rgba(14,23,38,0.88)";
+        ctx.fillRect(mx - tw / 2 - 6, my - fs / 2 - 4, tw + 12, fs + 8);
+        ctx.fillStyle = C.green;
+        ctx.fillText(label, mx, my);
         ctx.restore();
       });
       const link = document.createElement("a");
@@ -541,6 +639,71 @@ export default function FurniturePlanner() {
             </div>
           </div>
 
+          {/* measure block */}
+          <div>
+            <div style={secLabel}>3 · Measure</div>
+            {!scale ? (
+              <div style={{ fontSize: 11, color: C.faint }}>Set the scale first ↑</div>
+            ) : !measuring ? (
+              <div style={{ fontSize: 12, color: C.dim, lineHeight: 1.5 }}>
+                Click two points on the plan to measure the distance between them.
+                <button style={btn({ marginTop: 8, width: "100%" })} onClick={startMeasure}>
+                  Measure distance
+                </button>
+              </div>
+            ) : (
+              <div style={{ padding: 10, background: C.panel2,
+                border: `1px solid ${C.green}`, borderRadius: 6, fontSize: 12 }}>
+                <div style={{ color: C.dim, marginBottom: 8 }}>
+                  {measurePts.length === 0 && "Click the first point on the plan."}
+                  {measurePts.length === 1 && "Click the second point."}
+                  {measurePts.length === 2 && "Distance:"}
+                </div>
+                {measurePts.length === 2 && (
+                  <>
+                    <div style={{ fontFamily: MONO, fontSize: 18, color: C.green, marginBottom: 8 }}>
+                      {ftIn(distFt(measurePts[0], measurePts[1]) * 12)}
+                    </div>
+                    <input value={measureName} placeholder="Name (optional)"
+                      onChange={(e) => setMeasureName(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && saveMeasure()}
+                      style={{ width: "100%", background: C.void, color: C.text, boxSizing: "border-box",
+                        border: `1px solid ${C.line}`, borderRadius: 4, padding: "6px 8px",
+                        fontSize: 12, marginBottom: 8 }} />
+                    <button style={btn({ width: "100%", background: C.green, color: C.void,
+                      fontWeight: 600, border: "none", marginBottom: 6 })} onClick={saveMeasure}>
+                      Save measurement
+                    </button>
+                  </>
+                )}
+                <button style={btn({ width: "100%" })} onClick={stopMeasure}>Done measuring</button>
+              </div>
+            )}
+            {measures.length > 0 && (
+              <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 5 }}>
+                {measures.map((m) => (
+                  <div key={m.id} onClick={() => { setSel(null); setSelMeasure(m.id); }}
+                    style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
+                      background: selMeasure === m.id ? C.panel2 : "transparent",
+                      border: `1px solid ${selMeasure === m.id ? C.green : C.line}`,
+                      borderRadius: 5, padding: "5px 8px" }}>
+                    <span style={{ flex: 1, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis",
+                      whiteSpace: "nowrap" }}>
+                      {m.name || "Measurement"}
+                    </span>
+                    <span style={{ fontFamily: MONO, fontSize: 11, color: C.green }}>
+                      {ftIn(distFt({ x: m.ax, y: m.ay }, { x: m.bx, y: m.by }) * 12)}
+                    </span>
+                    <span style={{ fontSize: 12, color: C.dim }} title="Delete"
+                      onClick={(e) => { e.stopPropagation();
+                        setMeasures((p) => p.filter((x) => x.id !== m.id));
+                        if (selMeasure === m.id) setSelMeasure(null); }}>✕</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           {/* view options */}
           <div>
             <div style={secLabel}>View</div>
@@ -611,8 +774,11 @@ export default function FurniturePlanner() {
             </div>
           ) : (
             <div ref={contentRef} data-bg="1" onPointerDown={onCanvasDown}
+              onPointerMove={(e) => {
+                if (measuring && measurePts.length === 1) setHoverPt(toImg(e.clientX, e.clientY));
+              }}
               style={{ position: "relative", width: cw, height: ch, margin: 12,
-                cursor: calib ? "crosshair" : "default", boxShadow: "0 0 0 1px " + C.line }}>
+                cursor: calib || measuring ? "crosshair" : "default", boxShadow: "0 0 0 1px " + C.line }}>
               <img src={img} alt="floor plan" data-bg="1" draggable={false}
                 style={{ width: "100%", height: "100%", display: "block", userSelect: "none" }} />
 
@@ -678,6 +844,65 @@ export default function FurniturePlanner() {
                   </div>
                 );
               })}
+
+              {scale && (measures.length > 0 || measurePts.length > 0) && (
+                <svg width={cw} height={ch} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+                  {/* saved measurements */}
+                  {measures.map((m) => {
+                    const a = { x: m.ax * zoom, y: m.ay * zoom };
+                    const b = { x: m.bx * zoom, y: m.by * zoom };
+                    const isSel = m.id === selMeasure;
+                    const col = isSel ? C.amber : C.green;
+                    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+                    const label = `${m.name ? m.name + "  " : ""}${ftIn(distFt({ x: m.ax, y: m.ay }, { x: m.bx, y: m.by }) * 12)}`;
+                    const boxW = label.length * 7.2 + 14, boxH = 20;
+                    return (
+                      <g key={m.id}>
+                        <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="transparent" strokeWidth="14"
+                          style={{ pointerEvents: "stroke", cursor: "pointer" }}
+                          onPointerDown={(e) => selectMeasure(e, m)} />
+                        <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke={col}
+                          strokeWidth={isSel ? 2.5 : 2} strokeDasharray="6 4" />
+                        {[["a", a], ["b", b]].map(([end, p]) => (
+                          <circle key={end} cx={p.x} cy={p.y} r={isSel ? 7 : 5} fill={col}
+                            stroke={C.void} strokeWidth="1.5"
+                            style={{ pointerEvents: "all", cursor: isSel ? "grab" : "pointer", touchAction: "none" }}
+                            onPointerDown={(e) => (isSel ? measureEndDown(e, m, end) : selectMeasure(e, m))} />
+                        ))}
+                        <g onPointerDown={(e) => selectMeasure(e, m)}
+                          style={{ pointerEvents: "all", cursor: "pointer" }}>
+                          <rect x={mx - boxW / 2} y={my - boxH / 2} width={boxW} height={boxH} rx="5"
+                            fill="rgba(14,23,38,0.9)" stroke={col} strokeWidth="1" />
+                          <text x={mx} y={my} fill={col} fontFamily={MONO} fontSize="12" fontWeight="600"
+                            textAnchor="middle" dominantBaseline="central">{label}</text>
+                        </g>
+                      </g>
+                    );
+                  })}
+                  {/* in-progress preview */}
+                  {measurePts.length > 0 && (() => {
+                    const a = measurePts[0];
+                    const b = measurePts[1] || hoverPt;
+                    return (
+                      <g>
+                        {b && (
+                          <line x1={a.x * zoom} y1={a.y * zoom} x2={b.x * zoom} y2={b.y * zoom}
+                            stroke={C.green} strokeWidth="2" strokeDasharray="6 4" />
+                        )}
+                        {measurePts.map((pt, i) => (
+                          <circle key={i} cx={pt.x * zoom} cy={pt.y * zoom} r="5" fill={C.green}
+                            stroke={C.void} strokeWidth="1.5" />
+                        ))}
+                        {b && measurePts.length < 2 && (
+                          <text x={((a.x + b.x) / 2) * zoom} y={((a.y + b.y) / 2) * zoom - 10}
+                            fill={C.green} fontFamily={MONO} fontSize="12" fontWeight="600"
+                            textAnchor="middle">{ftIn(distFt(a, b) * 12)}</text>
+                        )}
+                      </g>
+                    );
+                  })()}
+                </svg>
+              )}
 
               {(calib || pts.length > 0) && (
                 <svg width={cw} height={ch} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
@@ -752,6 +977,33 @@ export default function FurniturePlanner() {
               <button style={btn({ flex: 1, color: "#E0738C", borderColor: "#5e3340" })}
                 onClick={() => { setItems((p) => p.filter((i) => i.id !== sel)); setSel(null); }}>Delete</button>
             </div>
+          </div>
+        )}
+
+        {/* measurement inspector */}
+        {selMeasureObj && !selItem && (
+          <div style={{ width: 220, borderLeft: `1px solid ${C.line}`, background: C.panel,
+            padding: 14, display: "flex", flexDirection: "column", gap: 14, overflowY: "auto" }}>
+            <div style={secLabel}>Measurement</div>
+            <div style={{ fontFamily: MONO, fontSize: 26, color: C.green }}>
+              {ftIn(distFt({ x: selMeasureObj.ax, y: selMeasureObj.ay },
+                { x: selMeasureObj.bx, y: selMeasureObj.by }) * 12)}
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: C.dim, marginBottom: 3 }}>Name</div>
+              <input value={selMeasureObj.name} placeholder="Optional name"
+                onChange={(e) => setMeasures((p) => p.map((m) =>
+                  m.id === selMeasure ? { ...m, name: e.target.value } : m))}
+                style={{ width: "100%", background: C.void, color: C.text, boxSizing: "border-box",
+                  border: `1px solid ${C.line}`, borderRadius: 5, padding: "7px 9px", fontSize: 13 }} />
+            </div>
+            <div style={{ fontSize: 11, color: C.dim, lineHeight: 1.5 }}>
+              Drag either endpoint on the plan to adjust.
+            </div>
+            <button style={btn({ marginTop: "auto", color: "#E0738C", borderColor: "#5e3340" })}
+              onClick={() => { setMeasures((p) => p.filter((m) => m.id !== selMeasure)); setSelMeasure(null); }}>
+              Delete measurement
+            </button>
           </div>
         )}
       </div>
