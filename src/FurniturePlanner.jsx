@@ -1,4 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
+import {
+  HAS_STORE, AUTOSAVE_ID, SCHEMA_VERSION, uid,
+  putLayout, getLayout, deleteLayout, listLayouts,
+} from "./layoutStore.js";
 
 // ── drafting-table palette ──────────────────────────────────────────────
 const C = {
@@ -58,11 +62,6 @@ const ftIn = (inches) => {
   return `${ft}'${i}"`;
 };
 
-const HAS_STORE = typeof window !== "undefined" && !!window.storage;
-const PREFIX = "plan:";
-const AUTOKEY = "plan:__autosave__";
-const keyFor = (name) => PREFIX + encodeURIComponent(name);
-
 export default function FurniturePlanner() {
   const [img, setImg] = useState(null);
   const [nat, setNat] = useState(null); // {w,h} natural px
@@ -87,10 +86,13 @@ export default function FurniturePlanner() {
   const [measureName, setMeasureName] = useState("");
 
   // persistence
-  const [plans, setPlans] = useState([]);
-  const [planName, setPlanName] = useState("");
+  const [plans, setPlans] = useState([]);        // saved layout records (metadata + data)
+  const [planName, setPlanName] = useState("");  // "Save as" name field
+  const [currentId, setCurrentId] = useState(null);   // id of the layout being edited
+  const [currentName, setCurrentName] = useState(""); // its name (for the header)
   const [status, setStatus] = useState(null);
   const [restored, setRestored] = useState(false);
+  const importRef = useRef(null);
 
   const vpRef = useRef(null);
   const contentRef = useRef(null);
@@ -143,7 +145,7 @@ export default function FurniturePlanner() {
         setNat({ w: W, h: H });
         setScale(null); setPts([]); setCalib(false); setItems([]); setSel(null);
         setMeasures([]); setMeasuring(false); setMeasurePts([]); setSelMeasure(null);
-        setRestored(false);
+        setRestored(false); setCurrentId(null); setCurrentName("");
         setZoom(fitZoom(W, H));
         setImg(dataURL);
       };
@@ -167,48 +169,109 @@ export default function FurniturePlanner() {
     if (d.nat) setZoom(fitZoom(d.nat.w, d.nat.h));
   };
 
-  // ── storage helpers ──
+  // ── storage helpers (IndexedDB-backed) ──
   const refreshPlans = useCallback(async () => {
     if (!HAS_STORE) return;
-    try {
-      const r = await window.storage.list(PREFIX);
-      const names = (r?.keys || [])
-        .filter((k) => k !== AUTOKEY)
-        .map((k) => decodeURIComponent(k.slice(PREFIX.length)));
-      setPlans(names.sort());
-    } catch { /* none yet */ }
+    try { setPlans(await listLayouts()); } catch { /* none yet */ }
   }, []);
 
-  const savePlan = async () => {
-    const name = planName.trim();
-    if (!name || !img || !HAS_STORE) return;
-    const payload = JSON.stringify({ v: 1, name, img, nat, scale, items, measures, grid, savedAt: Date.now() });
+  // snapshot of everything that makes up a layout
+  const snapshot = () => ({ img, nat, scale, items, measures, grid });
+
+  // write one named layout record and mark it as the one being edited
+  const writeLayout = async (id, name) => {
+    const record = { id, name, ...snapshot(), v: SCHEMA_VERSION, savedAt: Date.now() };
     try {
-      await window.storage.set(keyFor(name), payload, false);
-      setPlanName(""); flash(`Saved "${name}"`); refreshPlans();
+      await putLayout(record);
+      setCurrentId(id); setCurrentName(name);
+      await refreshPlans();
+      return true;
     } catch {
-      flash("Couldn't save — the plan image may be too large.", "err");
+      flash("Couldn't save — storage may be full.", "err");
+      return false;
     }
   };
 
-  const loadPlan = async (name) => {
-    if (!HAS_STORE) return;
-    try {
-      const r = await window.storage.get(keyFor(name));
-      if (r?.value) { applyState(JSON.parse(r.value)); flash(`Loaded "${name}"`); }
-    } catch { flash("Couldn't load that plan.", "err"); }
+  // "Save" — update the layout currently open for editing (in place)
+  const saveCurrent = async () => {
+    if (!img || !HAS_STORE || !currentId) return;
+    if (await writeLayout(currentId, currentName)) flash(`Saved "${currentName}"`);
   };
 
-  const deletePlan = async (name) => {
+  // "Save as" / first save — create a new named layout (confirm on name clash)
+  const saveAs = async () => {
+    const name = planName.trim();
+    if (!name || !img || !HAS_STORE) return;
+    const clash = plans.find((p) => p.name === name && p.id !== currentId);
+    if (clash && !window.confirm(`A layout named "${name}" already exists. Overwrite it?`)) return;
+    const id = clash ? clash.id : uid();
+    if (await writeLayout(id, name)) { setPlanName(""); flash(`Saved "${name}"`); }
+  };
+
+  const loadPlan = async (id) => {
     if (!HAS_STORE) return;
-    try { await window.storage.delete(keyFor(name)); refreshPlans(); } catch {}
+    try {
+      const r = await getLayout(id);
+      if (r?.img) {
+        applyState(r);
+        setCurrentId(r.id); setCurrentName(r.name || "");
+        setRestored(false); flash(`Loaded "${r.name}"`);
+      }
+    } catch { flash("Couldn't load that layout.", "err"); }
+  };
+
+  const deletePlan = async (id, name) => {
+    if (!HAS_STORE) return;
+    if (!window.confirm(`Delete saved layout "${name}"? This can't be undone.`)) return;
+    try {
+      await deleteLayout(id);
+      if (currentId === id) { setCurrentId(null); setCurrentName(""); }
+      refreshPlans();
+    } catch {}
   };
 
   const newPlan = () => {
     setImg(null); setNat(null); setScale(null); setItems([]); setSel(null);
     setCalib(false); setPts([]); setRestored(false);
     setMeasures([]); setMeasuring(false); setMeasurePts([]); setSelMeasure(null);
-    if (HAS_STORE) window.storage.delete(AUTOKEY).catch(() => {});
+    setCurrentId(null); setCurrentName(""); setPlanName("");
+    if (HAS_STORE) deleteLayout(AUTOSAVE_ID).catch(() => {});
+  };
+
+  // ── export the current layout to a .json file ──
+  const exportLayout = () => {
+    if (!img) return;
+    const name = (currentName || planName.trim() || "layout");
+    const data = { app: "furniture-planner", name, ...snapshot(), v: SCHEMA_VERSION, savedAt: Date.now() };
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.download = `${name.replace(/[^\w.-]+/g, "_")}.layout.json`;
+    link.href = url;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ── import a layout from a .json file ──
+  const importLayout = async (file) => {
+    if (!file) return;
+    try {
+      const d = JSON.parse(await file.text());
+      if (!d || !d.img) throw new Error("bad file");
+      applyState(d);
+      const base = (d.name || file.name.replace(/\.layout\.json$|\.json$/i, "") || "Imported");
+      const taken = new Set(plans.map((p) => p.name));
+      let name = base, n = 2;
+      while (taken.has(name)) name = `${base} (${n++})`;
+      if (HAS_STORE) {
+        const id = uid();
+        if (await writeLayout(id, name)) flash(`Imported "${name}"`);
+      } else {
+        setCurrentId(null); setCurrentName(name); flash(`Imported "${name}"`);
+      }
+    } catch {
+      flash("That doesn't look like a layout file.", "err");
+    }
   };
 
   // ── on mount: load saved list + restore last working session ──
@@ -217,10 +280,12 @@ export default function FurniturePlanner() {
       await refreshPlans();
       if (!HAS_STORE) return;
       try {
-        const r = await window.storage.get(AUTOKEY);
-        if (r?.value) {
-          const d = JSON.parse(r.value);
-          if (d.img) { applyState(d); setRestored(true); }
+        const d = await getLayout(AUTOSAVE_ID);
+        if (d?.img) {
+          applyState(d);
+          setCurrentId(d.currentId ?? null);
+          setCurrentName(d.currentName ?? "");
+          setRestored(true);
         }
       } catch {}
     })();
@@ -230,12 +295,11 @@ export default function FurniturePlanner() {
   useEffect(() => {
     if (!HAS_STORE || !img || !nat) return;
     const t = setTimeout(() => {
-      window.storage
-        .set(AUTOKEY, JSON.stringify({ v: 1, img, nat, scale, items, measures, grid, savedAt: Date.now() }), false)
-        .catch(() => {});
+      putLayout({ id: AUTOSAVE_ID, ...snapshot(), currentId, currentName,
+        v: SCHEMA_VERSION, savedAt: Date.now() }).catch(() => {});
     }, 800);
     return () => clearTimeout(t);
-  }, [img, nat, scale, items, measures, grid]);
+  }, [img, nat, scale, items, measures, grid, currentId, currentName]);
 
   // ── coordinate helpers ──
   const toImg = useCallback((cx, cy) => {
@@ -717,38 +781,85 @@ export default function FurniturePlanner() {
               onClick={() => setGrid((g) => !g)}>{grid ? "✓ " : ""}1-ft grid</button>
           </div>
 
-          {/* saved plans */}
-          {HAS_STORE && (
-            <div>
-              <div style={secLabel}>Saved plans</div>
+          {/* saved layouts */}
+          <div>
+            <div style={secLabel}>Saved layouts</div>
+
+            {/* what's currently being edited */}
+            <div style={{ fontSize: 11, color: C.dim, marginBottom: 8, lineHeight: 1.4 }}>
+              {currentId
+                ? <>Editing <span style={{ color: C.blue }}>{currentName}</span></>
+                : img ? "Unsaved layout" : "Upload a plan to begin"}
+            </div>
+
+            {/* update the open layout in place */}
+            {currentId && (
+              <button disabled={!img} style={btn({ width: "100%", marginBottom: 6,
+                background: C.blue, color: C.void, fontWeight: 600, border: "none",
+                opacity: img ? 1 : 0.4 })} onClick={saveCurrent}>
+                Save changes
+              </button>
+            )}
+
+            {/* save as a new named layout */}
+            {HAS_STORE && (
               <div style={{ display: "flex", gap: 6 }}>
-                <input value={planName} placeholder="Plan name"
+                <input value={planName} placeholder={currentId ? "Save as new name…" : "Layout name"}
                   onChange={(e) => setPlanName(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && savePlan()}
+                  onKeyDown={(e) => e.key === "Enter" && saveAs()}
                   style={{ width: "100%", background: C.void, color: C.text, boxSizing: "border-box",
                     border: `1px solid ${C.line}`, borderRadius: 5, padding: "6px 8px", fontSize: 12 }} />
                 <button disabled={!img || !planName.trim()}
                   style={btn({ opacity: img && planName.trim() ? 1 : 0.4 })}
-                  onClick={savePlan}>Save</button>
+                  onClick={saveAs}>{currentId ? "Save as" : "Save"}</button>
               </div>
+            )}
+
+            {/* export / import */}
+            <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+              <button disabled={!img} style={btn({ flex: 1, fontSize: 11,
+                opacity: img ? 1 : 0.4 })} onClick={exportLayout}>Export file</button>
+              <button style={btn({ flex: 1, fontSize: 11 })}
+                onClick={() => importRef.current?.click()}>Import file</button>
+              <input ref={importRef} type="file" accept="application/json,.json" style={{ display: "none" }}
+                onChange={(e) => { importLayout(e.target.files[0]); e.target.value = ""; }} />
+            </div>
+
+            {HAS_STORE ? (
               <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 5 }}>
                 {plans.length === 0 ? (
-                  <div style={{ fontSize: 11, color: C.faint }}>No saved plans yet.</div>
-                ) : plans.map((n) => (
-                  <div key={n} style={{ display: "flex", alignItems: "center", gap: 6,
-                    background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 5, padding: "5px 8px" }}>
-                    <span style={{ flex: 1, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis",
-                      whiteSpace: "nowrap", cursor: "pointer" }} title={`Load ${n}`}
-                      onClick={() => loadPlan(n)}>{n}</span>
-                    <span style={{ fontSize: 11, color: C.blue, cursor: "pointer" }}
-                      onClick={() => loadPlan(n)}>Load</span>
-                    <span style={{ fontSize: 13, color: C.dim, cursor: "pointer" }}
-                      title="Delete" onClick={() => deletePlan(n)}>✕</span>
-                  </div>
-                ))}
+                  <div style={{ fontSize: 11, color: C.faint }}>No saved layouts yet.</div>
+                ) : plans.map((p) => {
+                  const isCur = p.id === currentId;
+                  return (
+                    <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 6,
+                      background: isCur ? C.panel2 : C.panel2,
+                      border: `1px solid ${isCur ? C.blue : C.line}`, borderRadius: 5, padding: "5px 8px" }}>
+                      <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} title={`Load ${p.name}`}
+                        onClick={() => loadPlan(p.id)}>
+                        <div style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis",
+                          whiteSpace: "nowrap", color: isCur ? C.blue : C.text }}>{p.name}</div>
+                        {p.savedAt && (
+                          <div style={{ fontFamily: MONO, fontSize: 9, color: C.dim }}>
+                            {new Date(p.savedAt).toLocaleString([], { month: "short", day: "numeric",
+                              hour: "numeric", minute: "2-digit" })}</div>
+                        )}
+                      </div>
+                      <span style={{ fontSize: 11, color: C.blue, cursor: "pointer" }}
+                        onClick={() => loadPlan(p.id)}>Load</span>
+                      <span style={{ fontSize: 13, color: C.dim, cursor: "pointer" }}
+                        title="Delete" onClick={() => deletePlan(p.id, p.name)}>✕</span>
+                    </div>
+                  );
+                })}
               </div>
-            </div>
-          )}
+            ) : (
+              <div style={{ fontSize: 11, color: C.faint, marginTop: 8, lineHeight: 1.5 }}>
+                This browser can't store layouts here, but you can still Export a
+                layout to a file and Import it later.
+              </div>
+            )}
+          </div>
         </div>
 
         {/* canvas viewport */}
