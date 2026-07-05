@@ -106,6 +106,9 @@ export default function FurniturePlanner() {
   useEffect(() => { zoomRef.current = zoom; }, [zoom]);
 
   const selItem = items.find((i) => i.id === sel) || null;
+  const selIndex = selItem ? items.findIndex((i) => i.id === sel) : -1;
+  const atFront = selIndex === items.length - 1; // last drawn → on top
+  const atBack = selIndex === 0;
   const selMeasureObj = measures.find((m) => m.id === selMeasure) || null;
 
   // distance in feet between two image-coord points, given the current scale
@@ -481,6 +484,28 @@ export default function FurniturePlanner() {
     const id = idRef.current++;
     setItems((p) => [...p, { ...selItem, id, x: selItem.x + 20, y: selItem.y + 20 }]);
     setSel(id);
+  };
+
+  // ── layer ordering ──
+  // Stacking order is array order: later items render on top (and are drawn last
+  // in the PNG export). Reordering the selected piece is just moving it within
+  // the `items` array — "front"/"up" push it toward the end (on top).
+  const reorderSel = (mode) => {
+    setItems((p) => {
+      const i = p.findIndex((it) => it.id === sel);
+      if (i === -1) return p;
+      let j;
+      if (mode === "front") j = p.length - 1;
+      else if (mode === "back") j = 0;
+      else if (mode === "up") j = i + 1;
+      else if (mode === "down") j = i - 1;
+      else return p;
+      if (j < 0 || j > p.length - 1 || j === i) return p;
+      const next = p.slice();
+      const [it] = next.splice(i, 1);
+      next.splice(j, 0, it);
+      return next;
+    });
   };
 
   // ── measurements ──
@@ -1082,6 +1107,32 @@ export default function FurniturePlanner() {
                       border: selItem.ci === i ? `2px solid ${C.text}` : `2px solid transparent` }} />
                 ))}
               </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: C.dim, marginBottom: 5 }}>Layer order</div>
+              {(() => {
+                const layerBtn = (label, mode, disabled) => (
+                  <button
+                    disabled={disabled}
+                    onClick={() => reorderSel(mode)}
+                    style={btn({ flex: 1, padding: "6px 4px", fontSize: 11,
+                      opacity: disabled ? 0.4 : 1, cursor: disabled ? "not-allowed" : "pointer" })}>
+                    {label}
+                  </button>
+                );
+                return (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {layerBtn("Bring to front", "front", atFront)}
+                      {layerBtn("Send to bottom", "back", atBack)}
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      {layerBtn("Move up", "up", atFront)}
+                      {layerBtn("Move down", "down", atBack)}
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
             <div style={{ display: "flex", gap: 6, marginTop: "auto" }}>
               <button style={btn({ flex: 1 })} onClick={dupSel}>Duplicate</button>
